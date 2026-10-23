@@ -52,9 +52,9 @@ use vst3::Steinberg::Vst::{
 };
 use vst3::Steinberg::{
     FUnknown, IBStream, IBStreamTrait, IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewTrait,
-    IPluginBaseTrait, IPluginFactory, IPluginFactoryTrait, PClassInfo, PClassInfo_, TUID, ViewRect,
-    kPlatformTypeHWND, kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultFalse, kResultOk,
-    kResultTrue,
+    IPluginBaseTrait, IPluginFactory, IPluginFactory2, IPluginFactory2Trait, IPluginFactoryTrait,
+    PClassInfo, PClassInfo_, PClassInfo2, PFactoryInfo, TUID, ViewRect, kPlatformTypeHWND,
+    kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultFalse, kResultOk, kResultTrue,
 };
 use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
@@ -168,6 +168,14 @@ fn scan_dir_into(dir: &Path, out: &mut Vec<PluginInfo>) {
 fn scan_bundle_into(bundle: &Path, out: &mut Vec<PluginInfo>) -> Result<()> {
     let module = unsafe { LoadedModule::open(bundle) }?;
     let factory = module.factory()?;
+    // IPluginFactory2 adds sub-categories ("Instrument|Synth") and vendor.
+    let factory2 = factory.as_com_ref().cast::<IPluginFactory2>();
+    let mut factory_info: PFactoryInfo = unsafe { std::mem::zeroed() };
+    let factory_vendor = if unsafe { factory.getFactoryInfo(&raw mut factory_info) } == kResultOk {
+        char8_array_to_string(&factory_info.vendor)
+    } else {
+        String::new()
+    };
     let count = unsafe { factory.countClasses() };
     let mut info = empty_pclass_info();
     for idx in 0..count {
@@ -179,19 +187,44 @@ fn scan_bundle_into(bundle: &Path, out: &mut Vec<PluginInfo>) -> Result<()> {
             continue;
         }
         let name = char8_array_to_string(&info.name);
+        let mut info2: PClassInfo2 = unsafe { std::mem::zeroed() };
+        let (subcategories, vendor) = match &factory2 {
+            Some(f2) if unsafe { f2.getClassInfo2(idx, &raw mut info2) } == kResultOk => (
+                char8_array_to_string(&info2.subCategories),
+                char8_array_to_string(&info2.vendor),
+            ),
+            _ => (String::new(), String::new()),
+        };
+        let category = category_from_subcategories(&subcategories);
         out.push(PluginInfo {
             name,
-            vendor: String::new(),
+            vendor: if vendor.is_empty() {
+                factory_vendor.clone()
+            } else {
+                vendor
+            },
             version: 0,
-            category: PluginCategory::Effect,
+            category,
             path: bundle.to_path_buf(),
             unique_id: tuid_to_hex(&info.cid),
             format: FORMAT,
             has_editor: false,
-            accepts_midi: false,
+            accepts_midi: category == PluginCategory::Instrument,
         });
     }
     Ok(())
+}
+
+/// Maps VST3 `subCategories` ("Instrument|Synth", "Fx|Reverb", …).
+fn category_from_subcategories(sub: &str) -> PluginCategory {
+    let parts: Vec<&str> = sub.split('|').collect();
+    if parts.contains(&"Instrument") {
+        PluginCategory::Instrument
+    } else if parts.contains(&"Analyzer") {
+        PluginCategory::Analyzer
+    } else {
+        PluginCategory::Effect
+    }
 }
 
 fn empty_pclass_info() -> PClassInfo {
@@ -1804,6 +1837,23 @@ impl IBStreamTrait for MemoryStream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn category_from_vst3_subcategories() {
+        assert_eq!(
+            category_from_subcategories("Instrument|Synth"),
+            PluginCategory::Instrument
+        );
+        assert_eq!(
+            category_from_subcategories("Fx|Reverb"),
+            PluginCategory::Effect
+        );
+        assert_eq!(
+            category_from_subcategories("Fx|Analyzer"),
+            PluginCategory::Analyzer
+        );
+        assert_eq!(category_from_subcategories(""), PluginCategory::Effect);
+    }
+
     #[test]
     fn component_handler_forwards_edits_to_listener() {
         let listener: SharedListener = Arc::default();
