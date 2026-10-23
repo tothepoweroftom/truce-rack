@@ -36,6 +36,7 @@
 
 pub mod buffer;
 pub mod bus;
+pub mod controller;
 pub mod editor;
 pub mod error;
 pub mod events;
@@ -49,6 +50,7 @@ pub mod wrapper;
 
 pub use buffer::AudioBuffer;
 pub use bus::{BusKind, BusLayout, ChannelConfig};
+pub use controller::{ChangeKind, ChangeListener, ParamChange, PluginController};
 pub use editor::{PluginEditor, WindowHandle};
 pub use error::{Error, Result};
 pub use events::{Event, EventBody, EventList, MidiData};

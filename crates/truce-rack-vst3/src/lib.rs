@@ -25,6 +25,7 @@
 
 use truce_rack_core::buffer::AudioBuffer;
 use truce_rack_core::bus::BusLayout;
+use truce_rack_core::controller::{ChangeKind, ChangeListener, ParamChange, PluginController};
 use truce_rack_core::error::{Error, Result};
 use truce_rack_core::events::EventList;
 use truce_rack_core::info::{ParameterInfo, PluginCategory, PluginInfo, PresetInfo};
@@ -33,24 +34,29 @@ use truce_rack_core::scanner::PluginScanner;
 use truce_rack_core::transport::TransportInfo;
 use truce_rack_core::wrapper::run_audio_block_with;
 
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 use vst3::Steinberg::Vst::{
     AudioBusBuffers, AudioBusBuffers__type0, Event, Event_::EventTypes_, Event__type0,
-    IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentTrait, IConnectionPoint,
-    IConnectionPointTrait, IEditController, IEditControllerTrait, IEventList, IEventListTrait,
-    IParameterChanges, NoteOffEvent, NoteOnEvent, ParameterInfo as Vst3ParameterInfo,
+    IAudioProcessor, IAudioProcessorTrait, IComponent, IComponentHandler, IComponentHandlerTrait,
+    IComponentTrait, IConnectionPoint, IConnectionPointTrait, IEditController,
+    IEditControllerTrait, IEventList, IEventListTrait, IHostApplication, IHostApplicationTrait,
+    IParamValueQueue, IParamValueQueueTrait, IParameterChanges, IParameterChangesTrait,
+    NoteOffEvent, NoteOnEvent, ParamID, ParamValue, ParameterInfo as Vst3ParameterInfo,
     ParameterInfo_::ParameterFlags_, PolyPressureEvent, ProcessContext as Vst3ProcessContext,
-    ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_, ProcessSetup,
+    ProcessContext_::StatesAndFlags_, ProcessData, ProcessModes_, ProcessSetup, String128,
     SymbolicSampleSizes_, ViewType,
 };
 use vst3::Steinberg::{
-    IBStream, IBStreamTrait, IPlugView, IPlugViewTrait, IPluginBaseTrait, IPluginFactory,
-    IPluginFactoryTrait, PClassInfo, PClassInfo_, TUID, ViewRect, kPlatformTypeHWND,
-    kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultOk, kResultTrue,
+    FUnknown, IBStream, IBStreamTrait, IPlugFrame, IPlugFrameTrait, IPlugView, IPlugViewTrait,
+    IPluginBaseTrait, IPluginFactory, IPluginFactoryTrait, PClassInfo, PClassInfo_, TUID, ViewRect,
+    kPlatformTypeHWND, kPlatformTypeNSView, kPlatformTypeX11EmbedWindowID, kResultFalse, kResultOk,
+    kResultTrue,
 };
-use vst3::{Class, ComPtr, ComWrapper};
+use vst3::{Class, ComPtr, ComRef, ComWrapper};
 
 /// Format identifier used on returned [`PluginInfo`].
 pub const FORMAT: &str = "vst3";
@@ -533,13 +539,19 @@ pub struct Vst3Plugin {
     param_count: usize,
     processing: bool,
 
-    /// Cached `IPlugView` for the plugin's editor. Created on
-    /// `open()`, released on `close()` / Drop.
-    view: Option<ComPtr<IPlugView>>,
-    editor_open: bool,
+    /// UI / parameter side; `None` once handed out by `take_controller`.
+    ctl: Option<Vst3Controller>,
+    // Host-side COM objects the plugin holds pointers to; kept alive here.
+    _host: ComWrapper<HostApplication>,
+    _handler: ComWrapper<ComponentHandler>,
+    // Pre-allocated per-block buffers so `process` doesn't allocate.
+    in_events: ComWrapper<EventList3>,
+    out_events: ComWrapper<EventList3>,
+    in_params: ComWrapper<ParamChanges>,
 }
 
 impl Vst3Plugin {
+    #[allow(clippy::too_many_lines)]
     fn load_from(info: &PluginInfo) -> Result<Self> {
         let module = unsafe { LoadedModule::open(&info.path) }?;
         let factory = module.factory()?;
@@ -559,10 +571,13 @@ impl Vst3Plugin {
             })?;
         let component = component_ptr;
 
-        // Initialize the component. Many plugins accept a NULL
-        // context (hosts only need to supply IHostApplication for
-        // plugins that look it up via queryInterface).
-        if unsafe { component.initialize(ptr::null_mut()) } != kResultOk {
+        // Initialize the component with a host context; some plugins
+        // refuse to load without IHostApplication.
+        let host = ComWrapper::new(HostApplication);
+        let host_ptr: *mut FUnknown = host
+            .as_com_ref::<IHostApplication>()
+            .map_or(ptr::null_mut(), |h| h.as_ptr().cast());
+        if unsafe { component.initialize(host_ptr) } != kResultOk {
             return Err(Error::LoadFailed {
                 path: info.path.clone(),
                 reason: "IComponent::initialize returned non-OK".into(),
@@ -589,7 +604,7 @@ impl Vst3Plugin {
                     path: info.path.clone(),
                     reason: "factory.createInstance(IEditController) returned NULL".into(),
                 })?;
-            if unsafe { ctrl_ptr.initialize(ptr::null_mut()) } != kResultOk {
+            if unsafe { ctrl_ptr.initialize(host_ptr) } != kResultOk {
                 return Err(Error::LoadFailed {
                     path: info.path.clone(),
                     reason: "IEditController::initialize returned non-OK".into(),
@@ -642,6 +657,24 @@ impl Vst3Plugin {
         // a heavier-weight host would defer this to first open.)
         info.has_editor = unsafe { create_editor_view(&controller) }.is_some();
 
+        // Edits made in the plugin's own UI arrive through this handler.
+        let listener: SharedListener = Arc::default();
+        let handler = ComWrapper::new(ComponentHandler {
+            listener: listener.clone(),
+        });
+        if let Some(h) = handler.as_com_ref::<IComponentHandler>() {
+            unsafe { controller.setComponentHandler(h.as_ptr()) };
+        }
+
+        let ctl = Vst3Controller {
+            controller: controller.clone(),
+            param_count,
+            has_editor: info.has_editor,
+            view: None,
+            listener,
+            frame: ComWrapper::new(PlugFrame),
+        };
+
         Ok(Self {
             info,
             layouts: vec![BusLayout::stereo()],
@@ -655,8 +688,12 @@ impl Vst3Plugin {
             controller_cp,
             param_count,
             processing: false,
-            view: None,
-            editor_open: false,
+            ctl: Some(ctl),
+            _host: host,
+            _handler: handler,
+            in_events: ComWrapper::new(EventList3::with_capacity(MAX_EVENTS)),
+            out_events: ComWrapper::new(EventList3::with_capacity(MAX_EVENTS)),
+            in_params: ComWrapper::new(ParamChanges::new()),
         })
     }
 }
@@ -706,6 +743,9 @@ where
 
 impl Drop for Vst3Plugin {
     fn drop(&mut self) {
+        if let Some(ctl) = self.ctl.as_mut() {
+            truce_rack_core::editor::PluginEditor::close(ctl);
+        }
         if self.processing {
             unsafe { self.processor.setProcessing(0) };
         }
@@ -888,20 +928,69 @@ impl PluginCore for Vst3Plugin {
     }
 
     fn editor(&mut self) -> Option<&mut dyn truce_rack_core::editor::PluginEditor> {
-        if !self.info.has_editor {
-            return None;
-        }
-        Some(self)
+        self.ctl.as_mut()?.editor()
+    }
+
+    fn take_controller(&mut self) -> Option<Box<dyn PluginController>> {
+        self.ctl
+            .take()
+            .map(|c| Box::new(c) as Box<dyn PluginController>)
     }
 }
 
-impl truce_rack_core::editor::PluginEditor for Vst3Plugin {
+impl PluginController for Vst3Controller {
+    fn editor(&mut self) -> Option<&mut dyn truce_rack_core::editor::PluginEditor> {
+        if self.has_editor { Some(self) } else { None }
+    }
+
+    fn parameter_count(&self) -> usize {
+        self.param_count
+    }
+
+    fn parameter_info(&self, index: usize) -> Result<ParameterInfo> {
+        if index >= self.param_count {
+            return Err(Error::InvalidParameter(index));
+        }
+        let mut info = empty_parameter_info();
+        let i32_index = i32::try_from(index).map_err(|_| Error::InvalidParameter(index))?;
+        if unsafe { self.controller.getParameterInfo(i32_index, &raw mut info) } != kResultOk {
+            return Err(Error::InvalidParameter(index));
+        }
+        Ok(vst3_param_info_to_rack(&info))
+    }
+
+    fn parameter_value(&self, param_id: u32) -> Result<f64> {
+        Ok(unsafe { self.controller.getParamNormalized(param_id) })
+    }
+
+    fn set_parameter_value(&mut self, param_id: u32, value: f64) -> Result<()> {
+        if unsafe {
+            self.controller
+                .setParamNormalized(param_id, value.clamp(0.0, 1.0))
+        } != kResultOk
+        {
+            return Err(Error::Other(
+                "IEditController::setParamNormalized failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_change_listener(&mut self, listener: ChangeListener) {
+        *self
+            .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(listener);
+    }
+}
+
+impl truce_rack_core::editor::PluginEditor for Vst3Controller {
     fn open(
         &mut self,
         parent: truce_rack_core::editor::WindowHandle,
         _scale: f64,
     ) -> truce_rack_core::error::Result<()> {
-        if self.editor_open {
+        if self.view.is_some() {
             return Ok(());
         }
         let view = unsafe { create_editor_view(&self.controller) }
@@ -912,23 +1001,27 @@ impl truce_rack_core::editor::PluginEditor for Vst3Plugin {
                 "IPlugView::isPlatformTypeSupported returned false".into(),
             ));
         }
+        if let Some(frame) = self.frame.as_com_ref::<IPlugFrame>() {
+            unsafe { view.setFrame(frame.as_ptr()) };
+        }
         if unsafe { view.attached(parent_ptr, type_str) } != kResultOk {
             return Err(Error::Other("IPlugView::attached returned non-OK".into()));
         }
         self.view = Some(view);
-        self.editor_open = true;
         Ok(())
     }
 
     fn close(&mut self) {
         if let Some(view) = self.view.take() {
-            unsafe { view.removed() };
+            unsafe {
+                view.removed();
+                view.setFrame(ptr::null_mut());
+            }
         }
-        self.editor_open = false;
     }
 
     fn is_open(&self) -> bool {
-        self.editor_open
+        self.view.is_some()
     }
 
     fn size(&self) -> Option<(u32, u32)> {
@@ -1097,39 +1190,61 @@ impl Plugin<f32> for Vst3Plugin {
         }
         let frames = buffer.num_frames();
 
-        // Build an IEventList for the plugin's inputEvents slot.
-        // We translate truce-rack MIDI events to VST3 Event structs.
-        let mut translated = EventBuffer::default();
-        for event in events {
-            translated.push_rack(event);
+        // Translate events into the pre-allocated lists: MIDI into the
+        // IEventList, parameter values into IParameterChanges.
+        {
+            let mut midi = self.in_events.events.borrow_mut();
+            midi.clear();
+            self.in_params.clear();
+            for event in events {
+                if let truce_rack_core::events::EventBody::ParamValue { param_id, value } =
+                    event.body
+                {
+                    let offset = i32::try_from(event.sample_offset).unwrap_or(0);
+                    self.in_params.add(param_id, offset, value);
+                } else if midi.len() < midi.capacity()
+                    && let Some(ev) = translate_event(event)
+                {
+                    midi.push(ev);
+                }
+            }
+            self.out_events.events.borrow_mut().clear();
         }
-        let input_events_wrapper = ComWrapper::new(EventList3 {
-            events: std::cell::RefCell::new(translated.events),
-        });
-        let input_events_ptr = input_events_wrapper
-            .to_com_ptr::<IEventList>()
-            .ok_or_else(|| Error::Other("EventList3 missing IEventList IID".into()))?;
-        let output_events_wrapper = ComWrapper::new(EventList3::default());
-        let output_events_ptr = output_events_wrapper
-            .to_com_ptr::<IEventList>()
-            .ok_or_else(|| Error::Other("EventList3 missing IEventList IID".into()))?;
+        let in_events = self
+            .in_events
+            .as_com_ref::<IEventList>()
+            .map_or(ptr::null_mut(), |e| e.as_ptr());
+        let out_events = self
+            .out_events
+            .as_com_ref::<IEventList>()
+            .map_or(ptr::null_mut(), |e| e.as_ptr());
+        let in_params = self
+            .in_params
+            .as_com_ref::<IParameterChanges>()
+            .map_or(ptr::null_mut(), |e| e.as_ptr());
 
+        let mut input_ptrs = [ptr::null_mut::<f32>(); MAX_CHANNELS];
         let main_inputs = buffer.main_inputs();
-        let mut input_ptrs: Vec<*mut f32> =
-            main_inputs.iter().map(|c| c.as_ptr().cast_mut()).collect();
+        let n_in = main_inputs.len().min(MAX_CHANNELS);
+        for (p, c) in input_ptrs.iter_mut().zip(main_inputs.iter()) {
+            *p = c.as_ptr().cast_mut();
+        }
         let mut input_bus = AudioBusBuffers {
-            numChannels: i32::try_from(input_ptrs.len()).unwrap_or(0),
+            numChannels: i32::try_from(n_in).unwrap_or(0),
             silenceFlags: 0,
             __field0: AudioBusBuffers__type0 {
                 channelBuffers32: input_ptrs.as_mut_ptr(),
             },
         };
 
+        let mut output_ptrs = [ptr::null_mut::<f32>(); MAX_CHANNELS];
         let main_outputs = buffer.main_outputs();
-        let mut output_ptrs: Vec<*mut f32> =
-            main_outputs.iter_mut().map(|c| c.as_mut_ptr()).collect();
+        let n_out = main_outputs.len().min(MAX_CHANNELS);
+        for (p, c) in output_ptrs.iter_mut().zip(main_outputs.iter_mut()) {
+            *p = c.as_mut_ptr();
+        }
         let mut output_bus = AudioBusBuffers {
-            numChannels: i32::try_from(output_ptrs.len()).unwrap_or(0),
+            numChannels: i32::try_from(n_out).unwrap_or(0),
             silenceFlags: 0,
             __field0: AudioBusBuffers__type0 {
                 channelBuffers32: output_ptrs.as_mut_ptr(),
@@ -1152,10 +1267,10 @@ impl Plugin<f32> for Vst3Plugin {
             numOutputs: 1,
             inputs: &raw mut input_bus,
             outputs: &raw mut output_bus,
-            inputParameterChanges: ptr::null_mut::<IParameterChanges>(),
+            inputParameterChanges: in_params,
             outputParameterChanges: ptr::null_mut::<IParameterChanges>(),
-            inputEvents: input_events_ptr.as_ptr(),
-            outputEvents: output_events_ptr.as_ptr(),
+            inputEvents: in_events,
+            outputEvents: out_events,
             processContext: process_context
                 .as_mut()
                 .map_or(ptr::null_mut(), std::ptr::from_mut),
@@ -1177,101 +1292,104 @@ impl Plugin<f32> for Vst3Plugin {
 // EventList3 — in-memory IEventList impl for MIDI in/out.
 // ---------------------------------------------------------------------------
 
-/// Translation buffer for truce-rack-core `EventList` → VST3 `Event[]`.
-#[derive(Default)]
-struct EventBuffer {
-    events: Vec<Event>,
-}
-
-impl EventBuffer {
-    fn push_rack(&mut self, event: &truce_rack_core::events::Event) {
-        use truce_rack_core::events::{EventBody, MidiData};
-        let offset = i32::try_from(event.sample_offset).unwrap_or(i32::MAX);
-        let EventBody::Midi(body) = event.body else {
-            return;
-        };
-        let header = |type_: u16| Event {
-            busIndex: 0,
-            sampleOffset: offset,
-            ppqPosition: 0.0,
-            flags: 0,
-            r#type: type_,
-            __field0: Event__type0 {
+/// Translate one truce-rack MIDI event into a VST3 `Event`. Returns `None`
+/// for events VST3 doesn't carry in an `IEventList`.
+fn translate_event(event: &truce_rack_core::events::Event) -> Option<Event> {
+    use truce_rack_core::events::{EventBody, MidiData};
+    let offset = i32::try_from(event.sample_offset).unwrap_or(i32::MAX);
+    let EventBody::Midi(body) = event.body else {
+        return None;
+    };
+    let header = |type_: u16| Event {
+        busIndex: 0,
+        sampleOffset: offset,
+        ppqPosition: 0.0,
+        flags: 0,
+        r#type: type_,
+        __field0: Event__type0 {
+            noteOn: NoteOnEvent {
+                channel: 0,
+                pitch: 0,
+                tuning: 0.0,
+                velocity: 0.0,
+                length: 0,
+                noteId: -1,
+            },
+        },
+    };
+    match body {
+        MidiData::NoteOn {
+            channel,
+            note,
+            velocity,
+        } => {
+            let mut ev = header(u16::try_from(EventTypes_::kNoteOnEvent).unwrap_or(0));
+            ev.__field0 = Event__type0 {
                 noteOn: NoteOnEvent {
-                    channel: 0,
-                    pitch: 0,
+                    channel: i16::from(channel),
+                    pitch: i16::from(note),
                     tuning: 0.0,
-                    velocity: 0.0,
+                    velocity: f32::from(velocity) / 127.0,
                     length: 0,
                     noteId: -1,
                 },
-            },
-        };
-        match body {
-            MidiData::NoteOn {
-                channel,
-                note,
-                velocity,
-            } => {
-                let mut ev = header(u16::try_from(EventTypes_::kNoteOnEvent).unwrap_or(0));
-                ev.__field0 = Event__type0 {
-                    noteOn: NoteOnEvent {
-                        channel: i16::from(channel),
-                        pitch: i16::from(note),
-                        tuning: 0.0,
-                        velocity: f32::from(velocity) / 127.0,
-                        length: 0,
-                        noteId: -1,
-                    },
-                };
-                self.events.push(ev);
-            }
-            MidiData::NoteOff {
-                channel,
-                note,
-                velocity,
-            } => {
-                let mut ev = header(u16::try_from(EventTypes_::kNoteOffEvent).unwrap_or(0));
-                ev.__field0 = Event__type0 {
-                    noteOff: NoteOffEvent {
-                        channel: i16::from(channel),
-                        pitch: i16::from(note),
-                        velocity: f32::from(velocity) / 127.0,
-                        noteId: -1,
-                        tuning: 0.0,
-                    },
-                };
-                self.events.push(ev);
-            }
-            MidiData::PolyAftertouch {
-                channel,
-                note,
-                pressure,
-            } => {
-                let mut ev = header(u16::try_from(EventTypes_::kPolyPressureEvent).unwrap_or(0));
-                ev.__field0 = Event__type0 {
-                    polyPressure: PolyPressureEvent {
-                        channel: i16::from(channel),
-                        pitch: i16::from(note),
-                        pressure: f32::from(pressure) / 127.0,
-                        noteId: -1,
-                    },
-                };
-                self.events.push(ev);
-            }
-            // VST3 routes CC / ProgramChange / ChannelAftertouch /
-            // PitchBend / Sysex through IParameterChanges or
-            // IMidiMapping rather than IEventList. Wiring those is
-            // a follow-on; for hosting test purposes notes are the
-            // primary need.
-            _ => {}
+            };
+            return Some(ev);
         }
+        MidiData::NoteOff {
+            channel,
+            note,
+            velocity,
+        } => {
+            let mut ev = header(u16::try_from(EventTypes_::kNoteOffEvent).unwrap_or(0));
+            ev.__field0 = Event__type0 {
+                noteOff: NoteOffEvent {
+                    channel: i16::from(channel),
+                    pitch: i16::from(note),
+                    velocity: f32::from(velocity) / 127.0,
+                    noteId: -1,
+                    tuning: 0.0,
+                },
+            };
+            return Some(ev);
+        }
+        MidiData::PolyAftertouch {
+            channel,
+            note,
+            pressure,
+        } => {
+            let mut ev = header(u16::try_from(EventTypes_::kPolyPressureEvent).unwrap_or(0));
+            ev.__field0 = Event__type0 {
+                polyPressure: PolyPressureEvent {
+                    channel: i16::from(channel),
+                    pitch: i16::from(note),
+                    pressure: f32::from(pressure) / 127.0,
+                    noteId: -1,
+                },
+            };
+            return Some(ev);
+        }
+        // VST3 routes CC / ProgramChange / ChannelAftertouch /
+        // PitchBend / Sysex through IParameterChanges or
+        // IMidiMapping rather than IEventList. Wiring those is
+        // a follow-on; for hosting test purposes notes are the
+        // primary need.
+        _ => {}
     }
+    None
 }
 
 #[derive(Default)]
 struct EventList3 {
-    events: std::cell::RefCell<Vec<Event>>,
+    events: RefCell<Vec<Event>>,
+}
+
+impl EventList3 {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            events: RefCell::new(Vec::with_capacity(n)),
+        }
+    }
 }
 
 impl Class for EventList3 {
@@ -1297,11 +1415,278 @@ impl IEventListTrait for EventList3 {
     }
 
     unsafe fn addEvent(&self, event: *mut Event) -> i32 {
-        if event.is_null() {
-            return -1;
+        let mut events = self.events.borrow_mut();
+        // Never grow on the audio thread.
+        if event.is_null() || events.len() == events.capacity() {
+            return kResultFalse;
         }
-        self.events.borrow_mut().push(unsafe { *event });
+        events.push(unsafe { *event });
         kResultOk
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ParamChanges — pre-allocated IParameterChanges for host → processor values.
+// ---------------------------------------------------------------------------
+
+const MAX_CHANNELS: usize = 8;
+const MAX_EVENTS: usize = 512;
+const MAX_PARAM_QUEUES: usize = 64;
+const MAX_POINTS_PER_QUEUE: usize = 16;
+
+struct ParamQueue {
+    id: Cell<ParamID>,
+    points: RefCell<Vec<(i32, ParamValue)>>,
+}
+
+// SAFETY (EventList3, ParamQueue, ParamChanges): these are only touched by
+// `Vst3Plugin::process` and by the plugin during that call, which holds
+// `&mut Vst3Plugin` — never from two threads at once.
+unsafe impl Sync for EventList3 {}
+unsafe impl Sync for ParamQueue {}
+unsafe impl Sync for ParamChanges {}
+
+impl Class for ParamQueue {
+    type Interfaces = (IParamValueQueue,);
+}
+
+#[allow(clippy::cast_sign_loss)]
+impl IParamValueQueueTrait for ParamQueue {
+    unsafe fn getParameterId(&self) -> ParamID {
+        self.id.get()
+    }
+
+    unsafe fn getPointCount(&self) -> i32 {
+        i32::try_from(self.points.borrow().len()).unwrap_or(0)
+    }
+
+    unsafe fn getPoint(&self, index: i32, offset: *mut i32, value: *mut ParamValue) -> i32 {
+        let points = self.points.borrow();
+        let Some(&(o, v)) = usize::try_from(index).ok().and_then(|i| points.get(i)) else {
+            return kResultFalse;
+        };
+        if offset.is_null() || value.is_null() {
+            return kResultFalse;
+        }
+        unsafe {
+            *offset = o;
+            *value = v;
+        }
+        kResultOk
+    }
+
+    unsafe fn addPoint(&self, offset: i32, value: ParamValue, index: *mut i32) -> i32 {
+        let mut points = self.points.borrow_mut();
+        if points.len() == points.capacity() {
+            return kResultFalse;
+        }
+        points.push((offset, value));
+        if !index.is_null() {
+            unsafe { *index = i32::try_from(points.len() - 1).unwrap_or(0) };
+        }
+        kResultOk
+    }
+}
+
+struct ParamChanges {
+    queues: Vec<ComWrapper<ParamQueue>>,
+    used: Cell<usize>,
+}
+
+impl Class for ParamChanges {
+    type Interfaces = (IParameterChanges,);
+}
+
+impl ParamChanges {
+    fn new() -> Self {
+        let queues = (0..MAX_PARAM_QUEUES)
+            .map(|_| {
+                ComWrapper::new(ParamQueue {
+                    id: Cell::new(0),
+                    points: RefCell::new(Vec::with_capacity(MAX_POINTS_PER_QUEUE)),
+                })
+            })
+            .collect();
+        Self {
+            queues,
+            used: Cell::new(0),
+        }
+    }
+
+    fn clear(&self) {
+        for q in &self.queues[..self.used.get()] {
+            q.points.borrow_mut().clear();
+        }
+        self.used.set(0);
+    }
+
+    /// Index of the queue for `id`, claiming a free one if needed.
+    fn queue_for(&self, id: ParamID) -> Option<usize> {
+        let used = self.used.get();
+        if let Some(i) = self.queues[..used].iter().position(|q| q.id.get() == id) {
+            return Some(i);
+        }
+        if used == self.queues.len() {
+            return None;
+        }
+        self.queues[used].id.set(id);
+        self.used.set(used + 1);
+        Some(used)
+    }
+
+    /// Queue `value` for `id` at `offset`. Drops the point when full.
+    fn add(&self, id: ParamID, offset: i32, value: ParamValue) {
+        if let Some(i) = self.queue_for(id) {
+            unsafe { self.queues[i].addPoint(offset, value, ptr::null_mut()) };
+        }
+    }
+
+    fn queue_ptr(&self, i: usize) -> *mut IParamValueQueue {
+        self.queues[i]
+            .as_com_ref::<IParamValueQueue>()
+            .map_or(ptr::null_mut(), |q| q.as_ptr())
+    }
+}
+
+impl IParameterChangesTrait for ParamChanges {
+    unsafe fn getParameterCount(&self) -> i32 {
+        i32::try_from(self.used.get()).unwrap_or(0)
+    }
+
+    unsafe fn getParameterData(&self, index: i32) -> *mut IParamValueQueue {
+        match usize::try_from(index) {
+            Ok(i) if i < self.used.get() => self.queue_ptr(i),
+            _ => ptr::null_mut(),
+        }
+    }
+
+    unsafe fn addParameterData(
+        &self,
+        id: *const ParamID,
+        index: *mut i32,
+    ) -> *mut IParamValueQueue {
+        if id.is_null() {
+            return ptr::null_mut();
+        }
+        let Some(i) = self.queue_for(unsafe { *id }) else {
+            return ptr::null_mut();
+        };
+        if !index.is_null() {
+            unsafe { *index = i32::try_from(i).unwrap_or(0) };
+        }
+        self.queue_ptr(i)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-side COM objects: application context, component handler, plug frame.
+// ---------------------------------------------------------------------------
+
+type SharedListener = Arc<Mutex<Option<ChangeListener>>>;
+
+/// UI / parameter side of a [`Vst3Plugin`], see [`PluginController`].
+pub struct Vst3Controller {
+    controller: ComPtr<IEditController>,
+    param_count: usize,
+    has_editor: bool,
+    view: Option<ComPtr<IPlugView>>,
+    listener: SharedListener,
+    frame: ComWrapper<PlugFrame>,
+}
+
+// SAFETY: the controller is only used from one thread at a time (the host's
+// UI thread); VST3 objects aren't tied to the thread that created them.
+unsafe impl Send for Vst3Controller {}
+
+struct HostApplication;
+
+impl Class for HostApplication {
+    type Interfaces = (IHostApplication,);
+}
+
+impl IHostApplicationTrait for HostApplication {
+    unsafe fn getName(&self, name: *mut String128) -> i32 {
+        if name.is_null() {
+            return kResultFalse;
+        }
+        let out = unsafe { &mut *name };
+        out.fill(0);
+        for (o, c) in out.iter_mut().zip("PluginHost".encode_utf16()) {
+            *o = c;
+        }
+        kResultOk
+    }
+
+    unsafe fn createInstance(
+        &self,
+        _cid: *mut TUID,
+        _iid: *mut TUID,
+        obj: *mut *mut std::ffi::c_void,
+    ) -> i32 {
+        if !obj.is_null() {
+            unsafe { *obj = ptr::null_mut() };
+        }
+        kResultFalse
+    }
+}
+
+struct ComponentHandler {
+    listener: SharedListener,
+}
+
+impl ComponentHandler {
+    fn emit(&self, param_id: ParamID, value: f64, kind: ChangeKind) -> i32 {
+        if let Some(f) = self
+            .listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            f(ParamChange {
+                param_id,
+                value,
+                kind,
+            });
+        }
+        kResultOk
+    }
+}
+
+impl Class for ComponentHandler {
+    type Interfaces = (IComponentHandler,);
+}
+
+impl IComponentHandlerTrait for ComponentHandler {
+    unsafe fn beginEdit(&self, id: ParamID) -> i32 {
+        self.emit(id, 0.0, ChangeKind::Begin)
+    }
+
+    unsafe fn performEdit(&self, id: ParamID, value: ParamValue) -> i32 {
+        self.emit(id, value, ChangeKind::Value)
+    }
+
+    unsafe fn endEdit(&self, id: ParamID) -> i32 {
+        self.emit(id, 0.0, ChangeKind::End)
+    }
+
+    unsafe fn restartComponent(&self, _flags: i32) -> i32 {
+        kResultOk
+    }
+}
+
+struct PlugFrame;
+
+impl Class for PlugFrame {
+    type Interfaces = (IPlugFrame,);
+}
+
+impl IPlugFrameTrait for PlugFrame {
+    unsafe fn resizeView(&self, view: *mut IPlugView, new_size: *mut ViewRect) -> i32 {
+        // Accept the plugin's requested size; hosts read it back via `size()`.
+        match unsafe { ComRef::from_raw(view) } {
+            Some(v) if !new_size.is_null() => unsafe { v.onSize(new_size) },
+            _ => kResultFalse,
+        }
     }
 }
 
@@ -1419,6 +1804,71 @@ impl IBStreamTrait for MemoryStream {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn component_handler_forwards_edits_to_listener() {
+        let listener: SharedListener = Arc::default();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        *listener.lock().unwrap() = Some(Box::new(move |c| sink.lock().unwrap().push(c)));
+        let handler = ComWrapper::new(ComponentHandler { listener });
+        let h = handler.to_com_ptr::<IComponentHandler>().unwrap();
+        unsafe {
+            h.beginEdit(7);
+            h.performEdit(7, 0.25);
+            h.endEdit(7);
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert_eq!(
+            seen[1],
+            ParamChange {
+                param_id: 7,
+                value: 0.25,
+                kind: ChangeKind::Value
+            }
+        );
+        assert_eq!(
+            (seen[0].kind, seen[2].kind),
+            (ChangeKind::Begin, ChangeKind::End)
+        );
+    }
+
+    #[test]
+    fn param_changes_group_points_by_param_and_clear() {
+        let changes = ComWrapper::new(ParamChanges::new());
+        changes.add(3, 0, 0.1);
+        changes.add(9, 5, 0.9);
+        changes.add(3, 64, 0.2);
+        let c = changes.to_com_ptr::<IParameterChanges>().unwrap();
+        unsafe {
+            assert_eq!(c.getParameterCount(), 2);
+            let q = ComRef::from_raw(c.getParameterData(0)).unwrap();
+            assert_eq!((q.getParameterId(), q.getPointCount()), (3, 2));
+            let (mut off, mut val) = (0, 0.0);
+            q.getPoint(1, &raw mut off, &raw mut val);
+            assert_eq!((off, val), (64, 0.2));
+            assert!(c.getParameterData(2).is_null());
+        }
+        changes.clear();
+        assert_eq!(unsafe { c.getParameterCount() }, 0);
+    }
+
+    #[test]
+    fn param_changes_drop_points_when_full_instead_of_growing() {
+        let changes = ComWrapper::new(ParamChanges::new());
+        for i in 0..21 {
+            changes.add(1, i, 0.5);
+        }
+        assert_eq!(
+            changes.queues[0].points.borrow().len(),
+            MAX_POINTS_PER_QUEUE
+        );
+        assert_eq!(
+            changes.queues[0].points.borrow().capacity(),
+            MAX_POINTS_PER_QUEUE
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -200,6 +200,13 @@ pub trait PluginCore: Send {
     fn editor(&mut self) -> Option<&mut dyn crate::editor::PluginEditor> {
         None
     }
+
+    /// Split off the plugin's UI / parameter side so `process` can run on
+    /// another thread. Returns `Some` once; afterwards [`PluginCore::editor`]
+    /// returns `None`. Formats that don't support the split return `None`.
+    fn take_controller(&mut self) -> Option<Box<dyn crate::controller::PluginController>> {
+        None
+    }
 }
 
 /// Sample-precision-typed leaf trait. Pairs `PluginCore` with the

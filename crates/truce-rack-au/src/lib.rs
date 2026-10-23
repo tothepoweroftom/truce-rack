@@ -27,6 +27,7 @@
 
 use truce_rack_core::buffer::AudioBuffer;
 use truce_rack_core::bus::BusLayout;
+use truce_rack_core::controller::{ChangeKind, ChangeListener, ParamChange, PluginController};
 use truce_rack_core::error::{Error, Result};
 use truce_rack_core::events::EventList;
 use truce_rack_core::info::{ParameterInfo, PluginCategory, PluginInfo, PresetInfo};
@@ -598,12 +599,28 @@ pub struct AuPlugin {
     /// matching input/output; instruments may have 0 input).
     input_channels: u32,
     output_channels: u32,
+    /// UI / parameter side; `None` once handed out by `take_controller`.
+    ctl: Option<AuController>,
+}
+
+/// UI / parameter side of an [`AuPlugin`], see [`PluginController`].
+///
+/// Holds the same `AudioComponentInstance` as the plugin: AU parameter calls
+/// are safe from any thread, and the instance is disposed by the plugin, so
+/// drop this first.
+pub struct AuController {
+    instance: AudioComponentInstance,
+    param_ids: Vec<AudioUnitParameterID>,
+    has_editor: bool,
     /// Live editor state, populated by `PluginEditor::open`. The
     /// view-factory object (`AUCocoaUIBase`) and the resulting
-    /// `NSView` are kept alive here; dropping the plugin tears them
-    /// down via objc2's automatic retain/release.
+    /// `NSView` are kept alive here.
     editor: AuEditorState,
+    listener: Option<AuListener>,
 }
+
+// SAFETY: see the struct docs; the editor state is only touched from the UI thread.
+unsafe impl Send for AuController {}
 
 /// Per-plugin Cocoa-view editor state. Lives on the main thread
 /// only — never touched from the audio thread.
@@ -916,14 +933,20 @@ impl AuPlugin {
             layouts: vec![BusLayout::stereo()],
             active_layout: None,
             instance,
-            param_ids,
+            param_ids: param_ids.clone(),
             render_ctx: None,
             output_buffer_storage: Vec::new(),
             sample_time: 0.0,
             host_transport: None,
             input_channels: 0,
             output_channels: 0,
-            editor: AuEditorState::default(),
+            ctl: Some(AuController {
+                instance,
+                param_ids: param_ids.clone(),
+                has_editor,
+                editor: AuEditorState::default(),
+                listener: None,
+            }),
         })
     }
 }
@@ -996,6 +1019,10 @@ unsafe fn fetch_parameter_ids(unit: AudioComponentInstance) -> Vec<AudioUnitPara
 
 impl Drop for AuPlugin {
     fn drop(&mut self) {
+        if let Some(ctl) = self.ctl.as_mut() {
+            truce_rack_core::editor::PluginEditor::close(ctl);
+            ctl.listener = None;
+        }
         if !self.instance.is_null() {
             unsafe { AudioComponentInstanceDispose(self.instance) };
         }
@@ -1343,15 +1370,207 @@ impl PluginCore for AuPlugin {
     }
 
     fn editor(&mut self) -> Option<&mut dyn truce_rack_core::editor::PluginEditor> {
-        if self.info.has_editor {
-            Some(self)
-        } else {
-            None
-        }
+        self.ctl.as_mut()?.editor()
+    }
+
+    fn take_controller(&mut self) -> Option<Box<dyn PluginController>> {
+        self.ctl
+            .take()
+            .map(|c| Box::new(c) as Box<dyn PluginController>)
     }
 }
 
-impl truce_rack_core::editor::PluginEditor for AuPlugin {
+impl PluginController for AuController {
+    fn editor(&mut self) -> Option<&mut dyn truce_rack_core::editor::PluginEditor> {
+        if self.has_editor { Some(self) } else { None }
+    }
+
+    fn parameter_count(&self) -> usize {
+        self.param_ids.len()
+    }
+
+    fn parameter_info(&self, index: usize) -> Result<ParameterInfo> {
+        let id = *self
+            .param_ids
+            .get(index)
+            .ok_or(Error::InvalidParameter(index))?;
+        let info = unsafe { fetch_parameter_info(self.instance, id)? };
+        Ok(au_parameter_to_rack(id, &info))
+    }
+
+    fn parameter_value(&self, param_id: u32) -> Result<f64> {
+        let mut value: f32 = 0.0;
+        let status = unsafe {
+            AudioUnitGetParameter(
+                self.instance,
+                param_id,
+                kAudioUnitScope_Global,
+                0,
+                ptr::NonNull::new_unchecked(&raw mut value),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Other(format!(
+                "AudioUnitGetParameter failed: OSStatus {status}"
+            )));
+        }
+        Ok(f64::from(value))
+    }
+
+    fn set_parameter_value(&mut self, param_id: u32, value: f64) -> Result<()> {
+        #[allow(clippy::cast_possible_truncation)]
+        let status = unsafe {
+            AudioUnitSetParameter(
+                self.instance,
+                param_id,
+                kAudioUnitScope_Global,
+                0,
+                value as f32,
+                0,
+            )
+        };
+        if status != 0 {
+            return Err(Error::Other(format!(
+                "AudioUnitSetParameter failed: OSStatus {status}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn set_change_listener(&mut self, listener: ChangeListener) {
+        self.listener = None;
+        self.listener = AuListener::new(self.instance, &self.param_ids, listener);
+    }
+}
+
+/// Registration of an `AUEventListener` for every parameter of one AU. Events
+/// are delivered on the main run loop.
+struct AuListener {
+    listener: *mut std::ffi::c_void,
+    _callback: Box<ChangeListener>,
+}
+
+#[repr(C)]
+struct AuParameterEvent {
+    event_type: u32,
+    unit: AudioComponentInstance,
+    param_id: AudioUnitParameterID,
+    scope: u32,
+    element: u32,
+    _pad: u32, // the C union is sized for AudioUnitProperty, same layout
+}
+
+const AU_EVENT_VALUE: u32 = 0; // kAudioUnitEvent_ParameterValueChange
+const AU_EVENT_BEGIN: u32 = 1; // kAudioUnitEvent_BeginParameterChangeGesture
+const AU_EVENT_END: u32 = 2; // kAudioUnitEvent_EndParameterChangeGesture
+
+#[link(name = "AudioToolbox", kind = "framework")]
+unsafe extern "C" {
+    fn AUEventListenerCreate(
+        proc_: extern "C" fn(
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *const AuParameterEvent,
+            u64,
+            f32,
+        ),
+        user_data: *mut std::ffi::c_void,
+        run_loop: *const std::ffi::c_void,
+        mode: *const std::ffi::c_void,
+        notification_interval: f32,
+        granularity: f32,
+        out: *mut *mut std::ffi::c_void,
+    ) -> i32;
+    fn AUEventListenerAddEventType(
+        listener: *mut std::ffi::c_void,
+        object: *mut std::ffi::c_void,
+        event: *const AuParameterEvent,
+    ) -> i32;
+    fn AUListenerDispose(listener: *mut std::ffi::c_void) -> i32;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRunLoopGetMain() -> *const std::ffi::c_void;
+    static kCFRunLoopDefaultMode: *const std::ffi::c_void;
+}
+
+extern "C" fn on_au_event(
+    user_data: *mut std::ffi::c_void,
+    _object: *mut std::ffi::c_void,
+    event: *const AuParameterEvent,
+    _host_time: u64,
+    value: f32,
+) {
+    if user_data.is_null() || event.is_null() {
+        return;
+    }
+    let callback = unsafe { &*user_data.cast::<ChangeListener>() };
+    let event = unsafe { &*event };
+    let kind = match event.event_type {
+        AU_EVENT_VALUE => ChangeKind::Value,
+        AU_EVENT_BEGIN => ChangeKind::Begin,
+        AU_EVENT_END => ChangeKind::End,
+        _ => return,
+    };
+    callback(ParamChange {
+        param_id: event.param_id,
+        value: f64::from(value),
+        kind,
+    });
+}
+
+impl AuListener {
+    fn new(
+        instance: AudioComponentInstance,
+        params: &[AudioUnitParameterID],
+        callback: ChangeListener,
+    ) -> Option<Self> {
+        let mut callback = Box::new(callback);
+        let user_data = std::ptr::from_mut::<ChangeListener>(&mut callback).cast();
+        let mut listener = ptr::null_mut();
+        // 60 Hz notification interval; hosts coalesce further.
+        let status = unsafe {
+            AUEventListenerCreate(
+                on_au_event,
+                user_data,
+                CFRunLoopGetMain(),
+                kCFRunLoopDefaultMode,
+                1.0 / 60.0,
+                0.0,
+                &raw mut listener,
+            )
+        };
+        if status != 0 || listener.is_null() {
+            return None;
+        }
+        for &param_id in params {
+            for event_type in [AU_EVENT_VALUE, AU_EVENT_BEGIN, AU_EVENT_END] {
+                let event = AuParameterEvent {
+                    event_type,
+                    unit: instance,
+                    param_id,
+                    scope: kAudioUnitScope_Global,
+                    element: 0,
+                    _pad: 0,
+                };
+                unsafe { AUEventListenerAddEventType(listener, ptr::null_mut(), &raw const event) };
+            }
+        }
+        Some(Self {
+            listener,
+            _callback: callback,
+        })
+    }
+}
+
+impl Drop for AuListener {
+    fn drop(&mut self) {
+        unsafe { AUListenerDispose(self.listener) };
+    }
+}
+
+impl truce_rack_core::editor::PluginEditor for AuController {
     fn open(&mut self, parent: truce_rack_core::editor::WindowHandle, _scale: f64) -> Result<()> {
         use truce_rack_core::editor::WindowHandle;
         let WindowHandle::NSView(parent_ptr) = parent else {
@@ -1363,7 +1582,7 @@ impl truce_rack_core::editor::PluginEditor for AuPlugin {
         if self.editor.view.is_some() {
             return Ok(());
         }
-        unsafe { open_cocoa_editor(self, parent_ptr) }
+        unsafe { open_cocoa_editor(self.instance, &mut self.editor, parent_ptr) }
     }
 
     fn close(&mut self) {
@@ -1428,7 +1647,8 @@ type UiViewFn = unsafe extern "C-unwind" fn(
 /// subview of `parent_ptr`. Stores the live factory + view on
 /// `self.editor` so they survive `open` returning.
 unsafe fn open_cocoa_editor(
-    plugin: &mut AuPlugin,
+    instance: AudioComponentInstance,
+    editor: &mut AuEditorState,
     parent_ptr: *mut std::ffi::c_void,
 ) -> Result<()> {
     use objc2::msg_send;
@@ -1439,7 +1659,7 @@ unsafe fn open_cocoa_editor(
     let mut size: u32 = 0;
     let info_status = unsafe {
         AudioUnitGetPropertyInfo(
-            plugin.instance,
+            instance,
             kAudioUnitProperty_CocoaUI,
             kAudioUnitScope_Global,
             0,
@@ -1460,7 +1680,7 @@ unsafe fn open_cocoa_editor(
     let mut io_size = size;
     let get_status = unsafe {
         AudioUnitGetProperty(
-            plugin.instance,
+            instance,
             kAudioUnitProperty_CocoaUI,
             kAudioUnitScope_Global,
             0,
@@ -1548,7 +1768,7 @@ unsafe fn open_cocoa_editor(
     let factory_obj: *mut objc2::runtime::AnyObject =
         objc2::rc::Retained::as_ptr(&factory_retained).cast_mut();
     let view_raw: *mut objc2_app_kit::NSView =
-        unsafe { typed(factory_obj, sel, plugin.instance.cast(), pref) };
+        unsafe { typed(factory_obj, sel, instance.cast(), pref) };
     if view_raw.is_null() {
         return Err(Error::Other(
             "uiViewForAudioUnit:withSize: returned nil".into(),
@@ -1562,8 +1782,8 @@ unsafe fn open_cocoa_editor(
     let parent_view: *mut objc2_app_kit::NSView = parent_ptr.cast();
     let _: () = unsafe { msg_send![parent_view, addSubview: &*view] };
 
-    plugin.editor.factory = Some(factory_retained);
-    plugin.editor.view = Some(view);
+    editor.factory = Some(factory_retained);
+    editor.view = Some(view);
     Ok(())
 }
 
@@ -1668,7 +1888,21 @@ impl Plugin<f32> for AuPlugin {
         // accept MIDI; for plain audio effects the call no-ops
         // with `kAudioUnitErr_InvalidProperty`, which we ignore.
         for event in events {
-            send_midi(self.instance, event);
+            if let truce_rack_core::events::EventBody::ParamValue { param_id, value } = event.body {
+                #[allow(clippy::cast_possible_truncation)]
+                unsafe {
+                    AudioUnitSetParameter(
+                        self.instance,
+                        param_id,
+                        kAudioUnitScope_Global,
+                        0,
+                        value as f32,
+                        event.sample_offset,
+                    );
+                }
+            } else {
+                send_midi(self.instance, event);
+            }
         }
 
         // Refresh the render context's input pointers so the
