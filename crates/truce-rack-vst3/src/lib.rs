@@ -437,9 +437,16 @@ fn bundle_binary_path(bundle: &Path) -> PathBuf {
 /// `AddInstanceForFactory` during init). On Linux / Windows the
 /// underlying file is a plain dynamic library; `libloading` is
 /// enough.
+///
+/// The library is never freed. Plugins can leave window procedures, timers
+/// or threads behind after their last instance is gone, and freeing the
+/// library then crashes the host later in code that is no longer mapped
+/// (seen on Windows with Rubix, as `Rubix.vst3_unloaded`). Like most hosts,
+/// keep every module mapped until exit; loading it again only bumps its
+/// reference count.
 #[cfg(not(target_os = "macos"))]
 struct LoadedModule {
-    library: libloading::Library,
+    library: std::mem::ManuallyDrop<libloading::Library>,
 }
 
 #[cfg(target_os = "macos")]
@@ -457,7 +464,9 @@ impl LoadedModule {
                 path: bundle.to_path_buf(),
                 reason: format!("dlopen: {e}"),
             })?;
-        Ok(Self { library })
+        Ok(Self {
+            library: std::mem::ManuallyDrop::new(library),
+        })
     }
 
     fn factory(&self) -> Result<ComPtr<IPluginFactory>> {
@@ -557,8 +566,6 @@ pub struct Vst3Plugin {
     layouts: Vec<BusLayout>,
     active_layout: Option<BusLayout>,
 
-    // Hold the module open for the lifetime of the instance.
-    _module: LoadedModule,
     component: ComPtr<IComponent>,
     processor: ComPtr<IAudioProcessor>,
     controller: ComPtr<IEditController>,
@@ -581,6 +588,11 @@ pub struct Vst3Plugin {
     in_events: ComWrapper<EventList3>,
     out_events: ComWrapper<EventList3>,
     in_params: ComWrapper<ParamChanges>,
+    // Hold the module open for the lifetime of the instance. Must stay the
+    // last field: fields drop in declaration order, and on Windows dropping
+    // the module is a real `FreeLibrary`, so releasing any COM pointer above
+    // after it would call into unmapped code.
+    _module: LoadedModule,
 }
 
 impl Vst3Plugin {
@@ -798,6 +810,39 @@ impl Drop for Vst3Plugin {
     }
 }
 
+impl Vst3Plugin {
+    /// Buses start inactive in the VST3 SDK, and plugins built on its helpers
+    /// (or on frameworks that follow it strictly) then process nothing: the
+    /// host must activate them before `setActive(true)`. Activates the main
+    /// audio buses and event input, plus any bus the plugin flags
+    /// `kDefaultActive`. JUCE plugins ignore bus state, which is why missing
+    /// this went unnoticed with them.
+    fn activate_buses(&self) {
+        use vst3::Steinberg::Vst::{BusDirections_, BusInfo, BusInfo_::BusFlags_, MediaTypes_};
+        for (media, dir) in [
+            (MediaTypes_::kAudio, BusDirections_::kInput),
+            (MediaTypes_::kAudio, BusDirections_::kOutput),
+            (MediaTypes_::kEvent, BusDirections_::kInput),
+        ] {
+            // `DefaultEnumType` is `u32` on macOS and `i32` on Windows.
+            #[allow(clippy::cast_possible_wrap, clippy::unnecessary_cast)]
+            let (media, dir) = (media as i32, dir as i32);
+            let count = unsafe { self.component.getBusCount(media, dir) };
+            for index in 0..count {
+                // SAFETY: plain C struct; all-zero is a valid value.
+                let mut info: BusInfo = unsafe { std::mem::zeroed() };
+                let default_active =
+                    unsafe { self.component.getBusInfo(media, dir, index, &raw mut info) }
+                        == kResultOk
+                        && info.flags & BusFlags_::kDefaultActive as u32 != 0;
+                if index == 0 || default_active {
+                    let _ = unsafe { self.component.activateBus(media, dir, index, 1) };
+                }
+            }
+        }
+    }
+}
+
 impl PluginCore for Vst3Plugin {
     fn info(&self) -> &PluginInfo {
         &self.info
@@ -919,6 +964,7 @@ impl PluginCore for Vst3Plugin {
             self.processor
                 .setBusArrangements(&raw mut input_arr, 1, &raw mut output_arr, 1)
         };
+        self.activate_buses();
 
         let mut setup = ProcessSetup {
             #[allow(clippy::cast_possible_wrap)]
